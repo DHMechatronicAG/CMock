@@ -18,6 +18,16 @@ typedef struct _POINT_T
   int y;
 } POINT_T;
 
+/* The comments in the following enum are important, as are the newlines and commas */
+/* This combination caused a curious bug when used together. Make sure it doesn't come back. */
+typedef enum
+{
+    MY_ERROR_ID = -18,/**< Driver not ready */
+    MY_OTHER_ID = -19 /**< Node-id is in LSS unconfigured
+                           state. If objects are handled properly,
+                           his may not be an error. */
+} MY_STATE_ID_T;
+
 /* typedef edge case;
    not ANSI C but it has been done and will break cmock if not handled */
 typedef void VOID_TYPE_CRAZINESS;
@@ -101,3 +111,19 @@ inline int stuff(int num)
     }
     return reg;
 }
+
+/* it seems like CMock didn't love a func-looking struct before a func */
+#define FOO_TYPE(a) foo_##a
+struct FOO_TYPE(bar) { int baz; };
+char b(void);
+
+/* Here are more macros that sorta look like functions. Only sample_func is real */
+#define SAMPLE_EXTERN
+#define SAMPLE_MODE
+#define SAMPLE_DEPRECATED(a,b)
+struct struct_a;
+struct struct_b;
+SAMPLE_EXTERN SAMPLE_MODE SAMPLE_DEPRECATED(1.1.2, "It was bad. real bad()")
+void sample_func(struct struct_a **a,
+            struct struct_b **b,
+            ...);

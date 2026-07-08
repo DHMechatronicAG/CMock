@@ -6,6 +6,12 @@
 # =========================================================================
 
 ---
+:flags:
+  :gcc:
+    - -Wno-ignored-qualifiers
+  :clang:
+    - -Wno-ignored-qualifiers
+
 :cmock:
   :plugins: []
   :includes: []
@@ -15,3 +21,6 @@
   :treat_as_void:
   - OSEK_TASK
   - VOID_TYPE_CRAZINESS
+  :strippables:
+  - SAMPLE_EXTERN
+  - SAMPLE_MODE

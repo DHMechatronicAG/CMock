@@ -147,6 +147,27 @@ that they are pointing to the same memory address.
 * `retval func(void)` => (nothing. In fact, an additional function is only generated if the params list contains pointers)
 * `retval func(other, ptr* param)` => `void func_ExpectWithArrayAndReturn(other, ptr* param, int param_depth, retval_to_return)`
 
+When the `:array_size_name` and `:array_size_type` options are configured, CMock
+can recognize that a scalar parameter is the size of an adjacent pointer parameter
+and pair them together. When a size parameter is paired with a pointer, the `_Expect`
+call automatically uses it as the array depth, and `_ExpectWithArray` preserves
+the original argument order without adding a separate depth argument.
+
+When performing this type of automatic identification of arguments, CMock will also
+generate an additional `_ExpectWithArrayExtended`, which accepts an explicit
+depth for every pointer — allowing you to override the inferred depth when the
+pairing heuristic guesses wrong:
+
+* `void func(int size, ptr* buf)` =>
+  * `void func_ExpectWithArray(int size, ptr* buf)` _(depth inferred from `size`)_
+  * `void func_ExpectWithArrayExtended(int size, ptr* buf, int buf_Depth)` _(explicit override)_
+
+`_ExpectWithArrayExtended` is only generated for functions where at least one
+size parameter has been automatically identified. For all other functions the short
+`_ExpectWithArray` already gives full depth control. This function can be used to correct
+poor assumptions that CMock has made. It can also be used to separately verify a passed
+length, but compare the actual contents for a DIFFERENT number of elements.
+
 
 Ignore:
 -------
@@ -168,7 +189,7 @@ care how many times it was called, right?
 StopIgnore:
 -------
 
-Maybe you want to ignore a particular function for part of a test but dont want to
+Maybe you want to ignore a particular function for part of a test but don't want to
 ignore it later on. In that case, you want to use StopIgnore which will cancel the
 previously called Ignore or IgnoreAndReturn requiring you to Expect or otherwise
 handle the call to a function.
@@ -177,6 +198,25 @@ handle the call to a function.
 * `void func(params)` => `void func_StopIgnore(void)`
 * `retval func(void)` => `void func_StopIgnore(void)`
 * `retval func(params)` => `void func_StopIgnore(void)`
+
+It's important to note that the effect of this function is immediate and applies to
+this function's stack of expectations. So the following will work as intended:
+
+```
+Blah_Ignore();
+funcThatMightCallBlahButWeDoNotCare();
+Blah_StopIgnore();
+funcThatWeWantToMakeSureDoesNotCallBlah();
+```
+
+But this is NOT going to work, because StopIgnore immediately cancels ignore:
+
+```
+Blah_Ignore();
+Blah_StopIgnore();
+funcThatMightCallBlahButWeDoNotCare();
+funcThatWeWantToMakeSureDoesNotCallBlah();
+```
 
 IgnoreStateless:
 ----------------
@@ -273,6 +313,14 @@ order (based on any Expects you've set up) before calling the callback.
 to the callback instead. In this case, you are replacing the normal mock calls
 with your own custom stub function.
 
+Calling either `func_AddCallback` or `func_Stub` resets the call count for
+that function to zero, so `NumCalls` always reflects calls made since the
+current stub or callback was installed.
+
+You can read the current call count at any time using `func_CallCount()`.
+This is useful when you need to verify how many times a stub was invoked
+without setting up formal Expects.
+
 There is also an older name, `func_StubWithCallback`, which is just an alias
 for either `func_AddCallback` or `func_Stub` depending on setting of the
 `:callback_after_arg_check` toggle. This is deprecated and we recommend using
@@ -356,6 +404,23 @@ generate a skeleton instead:
 ```
 ruby cmock.rb --skeleton ../create/c/for/this.h
 ```
+
+Using CMock Without Ceedling
+----------------------------
+
+CMock depends on the Unity test framework, but it does not *require* Ceedling. You can use the 
+generated mocks directly with the Unity test framework in whatever build system you prefer. One 
+important thing to remember when doing this is that you will need to call the `_Init` function 
+for each of your mocks BEFORE the tests and the `_Verify` function for each mock AFTER each test.
+This allows CMock to perform all of its internal accounting. If you're running into problems where
+some errors aren't getting caught, this is likely what you are missing.
+
+There are many ways to accomplish this. Any is valid:
+
+  - These actions can be performed as part of `setUp` and `tearDown` in each test file
+  - You can hand-write your own RUN_TEST macro. If so, protect `_Verify` calls in `TEST_PROTECT`
+  - You can use Unity's test runner generator and it will automatically take care of this for you.
+  - You can use Ceedling and it will automatically take care of this for you.
 
 Config Options:
 ---------------
@@ -682,6 +747,20 @@ from the defaults. We've tried to specify what the defaults are below.
   * 2 for normal (default)
   * 3 for verbose
 
+* `:debug_output`:
+  When enabled, the generated mock will emit a `TEST_MESSAGE` for each
+  mock setup call (e.g. `_Expect`, `_Ignore`, `_AddCallback`) and each
+  actual mock invocation. This can help diagnose the order in which mock
+  calls are being set up and executed during a test.
+
+  For example, with `:debug_output: true` and a mocked function `int foo(int a)`,
+  the generated mock will print messages such as:
+
+      CMock: foo_ExpectAndReturn called
+      CMock: mock foo called
+
+  * default: false
+
 * `:weak`:
   When set this to some value, the generated mocks are defined as weak
   symbols using the configured format. This allows them to be overridden
@@ -722,11 +801,7 @@ from the defaults. We've tried to specify what the defaults are below.
 
   * `void GoBananas(Banana * bananas, int num_bananas)`
   * `int write_data(int fd, const uint8_t * data, uint32_t size)`
-
-  To recognize functions like these, CMock looks for a parameter list
-  containing a pointer (which could be an array) followed by something that
-  could be an array size.  "Something", by default, means an `int` or `size_t`
-  parameter with a name containing "size" or "len".
+  * `void store_data(int buf_size, uint8_t * buf)`
 
   `:array_size_type` is a list of additional types (besides `int` and `size_t`)
   that could be used for an array size parameter.  For example, to get CMock to
@@ -741,8 +816,30 @@ from the defaults. We've tried to specify what the defaults are below.
 
         cfg[:array_size_name] = 'size|len|num_'
 
-  Parameters must match *both* `:array_size_type` and `:array_size_name` (and
-  must come right after a pointer parameter) to be treated as an array size.
+  A parameter must match *both* `:array_size_type` and `:array_size_name` to be
+  treated as an array size.
+
+  **Pairing heuristic:** CMock scores each candidate size parameter against each
+  pointer parameter using name similarity. It strips size-words (e.g. "size",
+  "len") from the size parameter's name to derive a root, then checks whether
+  that root matches the pointer's name exactly (score 10), as a prefix or suffix
+  (score 7), or as a substring (score 5). Adjacency in the argument list adds a
+  small bonus (score +2). The highest-scoring pairing wins. This means CMock
+  correctly pairs `buff_size` with `buffer` even when another pointer appears
+  adjacent to `buff_size`.
+
+  Size parameters may appear either **before or after** the pointer they describe.
+  CMock recognizes both orderings:
+
+  * Size after pointer: `void func(uint8_t* buf, int buf_size)` — the `_Expect`
+    call uses `buf_size` as the depth automatically. `_ExpectWithArray` adds an
+    explicit `buf_Depth` argument after `buf` for manual override.
+
+  * Size before pointer: `void func(int buf_size, uint8_t* buf)` — the `_Expect`
+    call again uses `buf_size` as the depth automatically, and `_ExpectWithArray`
+    keeps arguments in their original order with no extra depth argument added.
+    An additional `_ExpectWithArrayExtended` variant is generated that does accept
+    an explicit depth, allowing you to override the inferred value when needed.
 
   Once you've told it how to recognize your arrays, CMock will give you `_Expect`
   calls that work more like `_ExpectWithArray`, and compare an array of objects
@@ -825,6 +922,29 @@ based on other settings, particularly Unity's settings.
   This needs to be something big enough to point anywhere in Cmock's
   memory space... usually it's a size_t.
 
+* `CMOCK_MEMCPY`
+  The memory-copy function used by CMock's internals and the generated mocks. 
+  It defaults to `memcpy` from `<string.h>`. Override alongside `CMOCK_MEMSET` 
+  to supply a custom implementation on targets where the standard library is 
+  unavailable or undesirable:
+
+  ```c
+  #define CMOCK_MEMCPY(dst, src, size) my_memcpy(dst, src, size)
+  ```
+
+* `CMOCK_MEMSET`
+  The memory-set function used by CMock's internals to zero-initialize
+  allocated blocks. It defaults to `memset` from `<string.h>`. Override
+  alongside `CMOCK_MEMCPY` to keep CMock fully independent of the standard
+  library:
+
+  ```c
+  #define CMOCK_MEMSET(dst, val, size) my_memset(dst, val, size)
+  ```
+
+  If both `CMOCK_MEMCPY` and `CMOCK_MEMSET` are defined before including
+  `cmock.h`, CMock will not pull in `<string.h>` at all.
+
 Other Tips
 ==========
 
@@ -850,8 +970,9 @@ that exposes them as virtual methods and modify your code to inject mocks at
 run-time... but there is another way!
 
 Simply use CMock to mock the static member methods and a C++ mocking framework
-to handle the virtual methods. (Yes, you can mix mocks from CMock and a C++
-mocking framework together in the same test!)
+to handle the virtual methods. CMock does NOT mock non-static members. For those,
+you'll need an actual C++ mocking framework. (Yes, you can mix mocks from CMock 
+and a C++ mocking framework together in the same test!)
 
 Keep in mind that since C++ mocking frameworks often link the real object to the
 unit test too, we need to resolve multiple definition errors with something like

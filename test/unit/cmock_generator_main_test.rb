@@ -50,6 +50,7 @@ describe CMockGenerator, "Verify CMockGenerator Module" do
     @config.expect :fail_on_unexpected_calls, true
     @config.expect :treat_inlines, :exclude
     @config.expect :exclude_setjmp_h, false
+    @config.expect :debug_output, false
     @cmock_generator = CMockGenerator.new(@config, @file_writer, @utils, @plugins)
     @cmock_generator.module_name = @module_name
     @cmock_generator.module_ext = '.h'
@@ -71,6 +72,7 @@ describe CMockGenerator, "Verify CMockGenerator Module" do
     @config.expect :fail_on_unexpected_calls, true
     @config.expect :treat_inlines, :exclude
     @config.expect :exclude_setjmp_h, false
+    @config.expect :debug_output, false
     @cmock_generator_strict = CMockGenerator.new(@config, @file_writer, @utils, @plugins)
 
     @test_project = {
@@ -539,6 +541,7 @@ describe CMockGenerator, "Verify CMockGenerator Module" do
                  "  return cmock_call_instance->ReturnVal;\n",
                  "}\n\n"
                ]
+    @plugins.expect :run, "",                 [:mock_precheck_return_thru_ptr, function]
     @plugins.expect :run, ["  uno"],          [:mock_implementation_precheck, function]
     @plugins.expect :run, ["  dos","  tres"], [:mock_implementation, function]
 
@@ -577,6 +580,7 @@ describe CMockGenerator, "Verify CMockGenerator Module" do
                  "  return cmock_call_instance->ReturnVal;\n",
                  "}\n\n"
                ]
+    @plugins.expect :run, "",                 [:mock_precheck_return_thru_ptr, function]
     @plugins.expect :run, ["  uno"],          [:mock_implementation_precheck, function]
     @plugins.expect :run, ["  dos","  tres"], [:mock_implementation, function]
 
@@ -618,6 +622,7 @@ describe CMockGenerator, "Verify CMockGenerator Module" do
                  "}\n",
                  "}\n\n",
                ]
+    @plugins.expect :run, "",                 [:mock_precheck_return_thru_ptr, function]
     @plugins.expect :run, ["  uno"],          [:mock_implementation_precheck, function]
     @plugins.expect :run, ["  dos","  tres"], [:mock_implementation, function]
 
@@ -656,6 +661,7 @@ describe CMockGenerator, "Verify CMockGenerator Module" do
                  "  return cmock_call_instance->ReturnVal;\n",
                  "}\n\n"
                ]
+    @plugins.expect :run, "",                 [:mock_precheck_return_thru_ptr, function]
     @plugins.expect :run, ["  uno"],          [:mock_implementation_precheck, function]
     @plugins.expect :run, ["  dos","  tres"], [:mock_implementation, function]
 

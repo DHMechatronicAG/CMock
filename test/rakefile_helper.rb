@@ -44,6 +44,7 @@ module RakefileHelpers
 
   def load_configuration(config_file, cmock_overlay = nil)
     $cfg_file = config_file
+    cmock_overlay += '.yml' if cmock_overlay && cmock_overlay !~ /\.yml$/i
     $proj = load_yaml('./project.yml')
 
     unity_targets_dir = '../vendor/unity/test/targets'
@@ -79,7 +80,7 @@ module RakefileHelpers
       raise "Cannot find Config File #{config_target}"
     end
 
-    $colour_output = $proj[:project][:colour]
+    $colour_output = $proj[:project][:colour] && !ENV['NO_COLOR']
   end
 
   def configure_clean
@@ -89,7 +90,6 @@ module RakefileHelpers
   def configure_toolchain(config_file = DEFAULT_CONFIG_FILE, cmock_overlay = nil)
     config_file = config_file || DEFAULT_CONFIG_FILE
     config_file += '.yml' unless config_file =~ /\.yml$/i
-    cmock_overlay += '.yml' if cmock_overlay && cmock_overlay !~ /\.yml$/i
     load_configuration(config_file, cmock_overlay)
     configure_clean
   end
@@ -144,10 +144,21 @@ module RakefileHelpers
     (($unity_cfg[:paths] || {})[:test] || []).select { |p| p.is_a?(Array) }
   end
 
-  # Returns the unsupported test list, regardless of whether it came from
-  # a CMock overlay or a CMock-only target file.
+  # Returns the full unsupported test list for the current toolchain, combining:
+  #   - explicit :unsupported lists from the CMock overlay and Unity target files
+  #   - implicit criteria (tests that require defines not present in the toolchain)
+  UNSUPPORTED_CRITERIA = {
+    'out_of_memory'       => { :defines => ['CMOCK_MEM_STATIC'] },
+    'unity_64bit_support' => { :defines => ['UNITY_SUPPORT_64'] }
+  }.freeze
+
   def unsupported_tests
-    ($cmock_cfg[:unsupported] || []) | ($unity_cfg[:unsupported] || [])
+    result = ($cmock_cfg[:unsupported] || []) | ($unity_cfg[:unsupported] || [])
+    conf_defs = all_defines
+    UNSUPPORTED_CRITERIA.each_pair do |name, crit|
+      result |= [name] if (crit[:defines] & conf_defs).empty?
+    end
+    result
   end
 
   # Resolve argument template tokens and produce a flat argument string.
@@ -183,7 +194,21 @@ module RakefileHelpers
     result.join(' ')
   end
 
-  def compile(file, extra_defines = [])
+  def compiler_basename
+    exe = $unity_cfg[:tools][:test_compiler][:executable]
+    File.basename(exe.is_a?(Array) ? exe.join : exe.to_s)
+  end
+
+  def extra_flags_for_compiler(flags_config)
+    return [] unless flags_config
+
+    basename = compiler_basename
+    flags_config.each_with_object([]) do |(compiler_key, flags), result|
+      result.concat(Array(flags)) if basename.include?(compiler_key.to_s)
+    end
+  end
+
+  def compile(file, extra_defines = [], extra_flags = [])
     tool       = $unity_cfg[:tools][:test_compiler]
     ext        = $unity_cfg[:extension][:object] || '.o'
     build_root = $proj[:project][:build_root] || 'build/'
@@ -195,6 +220,7 @@ module RakefileHelpers
                                   $proj[:paths][:include],
                                   all_defines(extra_defines),
                                   file, obj_file)
+    cmd_str += ' ' + extra_flags.join(' ') unless extra_flags.empty?
     execute(cmd_str)
     File.basename(obj_file)
   end
@@ -228,7 +254,7 @@ module RakefileHelpers
     { command: "#{executable} ", pre_support: pre, post_support: post }
   end
 
-  def execute(command_string, verbose=true, raise_on_failure=true)
+  def execute(command_string, verbose=false, raise_on_failure=true)
     report(command_string) if verbose
     output = `#{command_string}`.chomp
     report(output) if (verbose && !output.nil? && (output.length > 0))
@@ -320,20 +346,33 @@ module RakefileHelpers
   def run_system_test_interactions(test_case_files)
     load '../lib/cmock.rb'
 
-    SystemTestGenerator.new.generate_files(test_case_files)
-    test_files = FileList.new(SYSTEST_GENERATED_FILES_PATH + 'test*.c')
+    unsupported = unsupported_tests
+    test_case_files = test_case_files.reject do |f|
+      name = File.basename(f, YAML_EXTENSION)
+      if unsupported.include?(name)
+        report "Ignoring system test: #{name}"
+        true
+      end
+    end
 
-    load_configuration($cfg_file)
+    SystemTestGenerator.new.generate_files(test_case_files)
+
+    load_configuration($cfg_file, $cmock_test_overlay_file)
 
     include_dirs = get_local_include_dirs
 
     # Build and execute each unit test
-    test_files.each do |test|
+    test_case_files.each do |yaml|
 
       obj_list = []
 
-      test_base    = File.basename(test, C_EXTENSION)
-      cmock_config = test_base.gsub(/test_/, '') + '_cmock.yml'
+      name         = File.basename(yaml, YAML_EXTENSION)
+      test_base    = 'test_' + name
+      test         = SYSTEST_GENERATED_FILES_PATH + test_base + C_EXTENSION
+      cmock_config = name + '_cmock.yml'
+
+      yaml_content = load_yaml(yaml)
+      extra_flags  = extra_flags_for_compiler((yaml_content || {})[:flags])
 
       report "Executing system tests in #{File.basename(test)}..."
 
@@ -348,17 +387,17 @@ module RakefileHelpers
         end
         # Compile corresponding source file if it exists
         src_file = find_source_file(header, include_dirs)
-        obj_list << compile(src_file) unless src_file.nil?
+        obj_list << compile(src_file, [], extra_flags) unless src_file.nil?
       end
 
       # Generate and build the test suite runner
       runner_name = test_base + '_runner.c'
       runner_path = $proj[:paths][:source].first + runner_name
       UnityTestRunnerGenerator.new(SYSTEST_GENERATED_FILES_PATH + cmock_config).run(test, runner_path)
-      obj_list << compile(runner_path)
+      obj_list << compile(runner_path, [], extra_flags)
 
       # Build the test module
-      obj_list << compile(test)
+      obj_list << compile(test, [], extra_flags)
 
       # Link the test executable
       link_it(test_base, obj_list)
@@ -390,7 +429,9 @@ module RakefileHelpers
 
       test_file    = 'test_' + File.basename(test_case).ext(C_EXTENSION)
       result_file  = test_file.ext(RESULT_EXTENSION)
-      test_results = File.readlines(SYSTEST_BUILD_FILES_PATH + result_file).reject {|line| line.size < 10 }
+      all_results  = File.readlines(SYSTEST_BUILD_FILES_PATH + result_file).reject {|line| line.size < 10 }
+      info_results = all_results.select {|line| line =~ /:INFO:/}
+      test_results = all_results.reject {|line| line =~ /:INFO:/}
       tests.each_with_index do |test, index|
         this_failed = case(test[:pass])
           when :ignore
@@ -409,6 +450,11 @@ module RakefileHelpers
         elsif (test[:verify_error]) and not (test_results[index] =~ /test#{index+1}:.*#{test[:verify_error]}/)
           total_failures += 1
           new_msg = "#{test_file}:test#{index+1}:should #{test[:should]}:should have output matching '#{test[:verify_error]}' but was '#{test_results[index]}'"
+          failure_messages << new_msg
+          report new_msg
+        elsif (test[:verify_message]) and not info_results.any? {|line| line =~ /test#{index+1}:INFO:.*#{test[:verify_message]}/}
+          total_failures += 1
+          new_msg = "#{test_file}:test#{index+1}:should #{test[:should]}:should have message matching '#{test[:verify_message]}' but none found in: #{info_results.select{|l| l =~ /test#{index+1}:/}.inspect}"
           failure_messages << new_msg
           report new_msg
         else
@@ -459,7 +505,19 @@ module RakefileHelpers
 
   def run_system_test_compilations(mockables)
     load '../lib/cmock.rb'
-    load_configuration($cfg_file)
+    load_configuration($cfg_file, $cmock_test_overlay_file)
+
+    unsupported = unsupported_tests
+    mockables = mockables.reject do |f|
+      name = File.basename(f, '.h')
+      if unsupported.include?(name)
+        report "Ignoring system test compilation: #{name}"
+        true
+      end
+    end
+
+    compile_config = load_yaml(SYSTEST_COMPILE_MOCKABLES_PATH + 'config.yml')
+    extra_flags = extra_flags_for_compiler((compile_config || {})[:flags])
 
     report "\n"
     report "------------------------------------\n"
@@ -470,7 +528,7 @@ module RakefileHelpers
       mock_filename = 'mock_' + File.basename(header).ext('.c')
       CMock.new(SYSTEST_COMPILE_MOCKABLES_PATH + 'config.yml').setup_mocks(header)
       report "Compiling #{mock_filename}..."
-      compile(SYSTEST_GENERATED_FILES_PATH + mock_filename)
+      compile(SYSTEST_GENERATED_FILES_PATH + mock_filename, [], extra_flags)
       pass_count += 1
     end
     report "#{pass_count} Tests 0 Failures 0 Ignored\nOK\n"
@@ -479,7 +537,7 @@ module RakefileHelpers
 
   def run_system_test_profiles(mockables)
     load '../lib/cmock.rb'
-    load_configuration($cfg_file)
+    load_configuration($cfg_file, $cmock_test_overlay_file)
 
     report "\n"
     report "--------------------------\n"
@@ -530,7 +588,6 @@ module RakefileHelpers
     total_tests    = 0
     total_failures = 0
     total_ignored  = 0
-    puts "DEBUG DIS #{$cmock_test_config_file}"
     cfg_file = "#{($cmock_test_config_file =~ /[\\\/]/) ? '../' : ''}#{$cmock_test_config_file}" 
 
     # Determine which examples are valid for this platform

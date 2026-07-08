@@ -26,7 +26,11 @@ const char* CMockStringMismatch    = "Function called with unexpected argument v
     static CMOCK_MEM_INDEX_TYPE   CMock_Guts_BufferSize = CMOCK_MEM_ALIGN_SIZE;
     static CMOCK_MEM_INDEX_TYPE   CMock_Guts_FreePtr = CMOCK_MEM_ALIGN_SIZE;
 #else
+#if !defined(UNITY_EXCLUDE_STDDEF_H) && defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+    static _Alignas(max_align_t) long long CMock_Guts_Space[(CMOCK_MEM_SIZE + CMOCK_MEM_ALIGN_SIZE + sizeof(long long) - 1) / sizeof(long long)];
+#else
     static long long              CMock_Guts_Space[(CMOCK_MEM_SIZE + CMOCK_MEM_ALIGN_SIZE + sizeof(long long) - 1) / sizeof(long long)];
+#endif
     static unsigned char*         CMock_Guts_Buffer = (unsigned char*)CMock_Guts_Space;
     static CMOCK_MEM_INDEX_TYPE   CMock_Guts_BufferSize = CMOCK_MEM_SIZE + CMOCK_MEM_ALIGN_SIZE;//sizeof(CMock_Guts_Space);
     static CMOCK_MEM_INDEX_TYPE   CMock_Guts_FreePtr = CMOCK_MEM_ALIGN_SIZE;
@@ -68,7 +72,7 @@ CMOCK_MEM_INDEX_TYPE CMock_Guts_MemNew(CMOCK_MEM_INDEX_TYPE size)
 
     /* determine where we're putting this new block, and init its pointer to be the end of the line */
     index = CMock_Guts_FreePtr + CMOCK_MEM_INDEX_SIZE;
-    *(CMOCK_MEM_INDEX_TYPE*)(&CMock_Guts_Buffer[CMock_Guts_FreePtr]) = CMOCK_GUTS_NONE;
+    CMOCK_MEMSET(&CMock_Guts_Buffer[CMock_Guts_FreePtr], 0, CMOCK_MEM_INDEX_SIZE);
     CMock_Guts_FreePtr += size;
 
     return index;
@@ -108,7 +112,7 @@ CMOCK_MEM_INDEX_TYPE CMock_Guts_MemChain(CMOCK_MEM_INDEX_TYPE root_index, CMOCK_
         next = root;
         do
         {
-            index = *(CMOCK_MEM_INDEX_TYPE*)((CMOCK_MEM_PTR_AS_INT)next - CMOCK_MEM_INDEX_SIZE);
+            CMOCK_MEMCPY(&index, (unsigned char*)next - CMOCK_MEM_INDEX_SIZE, sizeof(index));
             if (index >= CMock_Guts_FreePtr)
             {
                 return CMOCK_GUTS_NONE;
@@ -119,7 +123,10 @@ CMOCK_MEM_INDEX_TYPE CMock_Guts_MemChain(CMOCK_MEM_INDEX_TYPE root_index, CMOCK_
             }
         }
         while (index > 0);
-        *(CMOCK_MEM_INDEX_TYPE*)((CMOCK_MEM_PTR_AS_INT)next - CMOCK_MEM_INDEX_SIZE) = (CMOCK_MEM_INDEX_TYPE)((CMOCK_MEM_PTR_AS_INT)obj - (CMOCK_MEM_PTR_AS_INT)CMock_Guts_Buffer);
+        {
+            CMOCK_MEM_INDEX_TYPE tmp = (CMOCK_MEM_INDEX_TYPE)((unsigned char*)obj - CMock_Guts_Buffer);
+            CMOCK_MEMCPY((unsigned char*)next - CMOCK_MEM_INDEX_SIZE, &tmp, sizeof(tmp));
+        }
         return root_index;
     }
 }
@@ -141,7 +148,7 @@ CMOCK_MEM_INDEX_TYPE CMock_Guts_MemNext(CMOCK_MEM_INDEX_TYPE previous_item_index
 
     /* if the pointer is good, then use it to look up the next index
      * (we know the first element always goes in zero, so NEXT must always be > 1) */
-    index = *(CMOCK_MEM_INDEX_TYPE*)((CMOCK_MEM_PTR_AS_INT)previous_item - CMOCK_MEM_INDEX_SIZE);
+    CMOCK_MEMCPY(&index, (unsigned char*)previous_item - CMOCK_MEM_INDEX_SIZE, sizeof(index));
     if ((index > 1) && (index < CMock_Guts_FreePtr))
     {
         return index;

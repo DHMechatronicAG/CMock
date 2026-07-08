@@ -15,7 +15,7 @@ class CMockHeaderParser
     @c_calling_conventions = cfg.c_calling_conventions.uniq
     @treat_as_array = cfg.treat_as_array
     @treat_as_void = (['void'] + cfg.treat_as_void).uniq
-    @function_declaration_parse_base_match = '([\w\s\*\(\),\[\]]*?\w[\w\s\*\(\),\[\]]*?)\(([\w\s\*\(\),\.\[\]+\-\/]*)\)'
+    @function_declaration_parse_base_match = '([^(]*\w)\s*\(([\w\s\*\(\),\.\[\]+\-\/]*)\)'
     @declaration_parse_matcher = /#{@function_declaration_parse_base_match}$/m
     @standards = (%w[int short char long unsigned signed] + cfg.treat_as.keys).uniq
     @array_size_name = cfg.array_size_name
@@ -26,6 +26,7 @@ class CMockHeaderParser
     @treat_externs = cfg.treat_externs
     @treat_inlines = cfg.treat_inlines
     @inline_function_patterns = cfg.inline_function_patterns
+    @ct_assert_patterns = cfg.ct_assert_patterns
     @c_strippables += ['extern'] if @treat_externs == :include # we'll need to remove the attribute if we're allowing externs
     @c_strippables += ['inline'] if @treat_inlines == :include # we'll need to remove the attribute if we're allowing inlines
   end
@@ -64,6 +65,48 @@ class CMockHeaderParser
 
   private if $ThisIsOnlyATest.nil? ################
 
+  # Remove code disabled by basic preprocesser tags like #if 0, #if 1, etc.
+  def remove_disabled_code_from_source(source)
+    result = []
+    emit = true
+    # Stack entries: [restore_emit, else_emit, seen_else]
+    #   restore_emit: value to restore `emit` to after matching #endif
+    #   else_emit:    value to set `emit` to after #else
+    #   seen_else:    whether #else at this level has already been seen
+    stack = []
+
+    source.each_line do |line|
+      stripped = line.strip
+      if stripped =~ /^#\s*if\s+0\s*$/
+        stack.push([emit, emit, false])
+        emit = false
+      elsif stripped =~ /^#\s*if\s+1\s*$/
+        stack.push([emit, false, false])
+        # emit unchanged: keep the if-branch
+      elsif stripped =~ /^#\s*if/
+        stack.push([emit, emit, false])
+        # emit unchanged: unknown condition, keep both branches
+      elsif stripped =~ /^#\s*else\b/
+        unless stack.empty?
+          entry = stack.last
+          unless entry[2]
+            stack[-1] = [entry[0], entry[1], true]
+            emit = entry[1]
+          end
+        end
+      elsif stripped =~ /^#\s*endif\b/
+        unless stack.empty?
+          entry = stack.pop
+          emit = entry[0]
+        end
+      elsif emit
+        result << line
+      end
+    end
+
+    result.join
+  end
+
   # Remove C/C++ comments from a string
   # +source+:: String which will have the comments removed
   def remove_comments_from_source(source)
@@ -75,15 +118,13 @@ class CMockHeaderParser
 
   def remove_nested_pairs_of_braces(source)
     # remove nested pairs of braces because no function declarations will be inside of them (leave outer pair for function definition detection)
-    if RUBY_VERSION.split('.')[0].to_i > 1
-      # we assign a string first because (no joke) if Ruby 1.9.3 sees this line as a regex, it will crash.
-      r = '\\{([^\\{\\}]*|\\g<0>)*\\}'
-      source.gsub!(/#{r}/m, '{ }')
-    else
-      while source.gsub!(/\{[^{}]*\{[^{}]*\}[^{}]*\}/m, '{ }')
-      end
+    # Collapse innermost brace pairs first using a brace-free sentinel (\x00), working
+    # outward until no balanced pairs remain. This avoids the catastrophic backtracking
+    # of the recursive regex \{([^\{\}]*|\g<0>)*\} on Ruby < 3.2 while preserving
+    # identical semantics: every balanced brace structure is collapsed to '{ }'.
+    while source.gsub!(/\{[^{}]*\}/m, "\x00")
     end
-
+    source.gsub!("\x00", '{ }')
     source
   end
 
@@ -248,23 +289,46 @@ class CMockHeaderParser
 
     # remove preprocessor statements and extern "C"
     source.gsub!(/extern\s+"C"\s*\{/, '')
+
+    # handle basic literal preprocessor conditionals before stripping all directives
+    source = remove_disabled_code_from_source(source)
+
     source.gsub!(/^\s*#.*/, '')
 
     # enums, unions, structs, and typedefs can all contain things (e.g. function pointers) that parse like function prototypes, so yank them
+    # pre-collapse nested brace pairs so that structs containing nested structs/unions are removed as a unit below
+    source = remove_nested_pairs_of_braces(source) unless cpp
     # forward declared structs are removed before struct definitions so they don't mess up real thing later. we leave structs keywords in function prototypes
     source.gsub!(/^[\w\s]*struct[^;{}()]+;/m, '') # remove forward declared structs
-    source.gsub!(/^[\w\s]*(enum|union|struct|typedef)[\w\s]*\{[^}]+\}[\w\s*,]*;/m, '') # remove struct, union, and enum definitions and typedefs with braces
+    source.gsub!(/^[\w\s]*(enum|union|struct|typedef)[\w\s()]*\{[^}]+\}[\w\s*,]*;/m, '') # remove struct, union, and enum definitions and typedefs with braces
     # remove problem keywords
     source.gsub!(/(\W)(?:register|auto|restrict)(\W)/, '\1\2')
     source.gsub!(/(\W)(?:static)(\W)/, '\1\2') unless cpp
 
+    # strip calls to known compile-time assertion macros by name -- never function prototypes regardless of argument form
+    source.gsub!(/\b(?:#{@ct_assert_patterns.join('|')})\s*\([^;]*\)/, '') unless @ct_assert_patterns.empty?
+    # strip any remaining WORD(...==...) etc. -- calls containing comparison operators cannot be C function prototypes
+    # must run before default-value removal, which would corrupt "!= 0" into "!" by removing "= 0"
+    source.gsub!(/\b\w+\s*\((?:[^()!=<>]|\([^()]*\))*(?:==|!=|<=|>=)[^;]*\)/, '')
+
     source.gsub!(/\s*=\s*['"a-zA-Z0-9_.]+\s*/, '') # remove default value statements from argument lists
+
+    # strip macro decorator patterns that cannot be C function prototypes.
+    # must run after default-value removal so "= \"str\"" doesn't trigger string detection.
+    # neutralize string literals (never valid in C prototype args), eliminating any parentheses
+    # inside string content (e.g. "msg()") that would fool subsequent brace-matching.
+    source.gsub!(/"[^"]*"/, '""')
+    # strip WORD("") -- any call with a string literal arg cannot be a C function prototype
+    source.gsub!(/\b\w+\s*\([^)]*""[^)]*\)/, '')
+    # strip WORD(N...) -- any call whose first arg starts with a digit cannot be a C prototype
+    source.gsub!(/\b\w+\s*\(\s*\d[^)]*\)/, '')
+
     source.gsub!(/^(?:[\w\s]*\W)?typedef\W[^;]*/m, '')                                     # remove typedef statements
     source.gsub!(/\)(\w)/, ') \1')                                                         # add space between parenthese and alphanumeric
     source.gsub!(/(^|\W+)(?:#{@c_strippables.join('|')})(?=$|\W+)/, '\1') unless @c_strippables.empty? # remove known attributes slated to be stripped
 
     # scan standalone function pointers and remove them, because they can just be ignored
-    source.gsub!(/\w+\s*\(\s*\*\s*\w+\s*\)\s*\([^)]*\)\s*;/, ';')
+    source.gsub!(/\w[\w\s*]*\(\s*\*\s*\w+\s*\)\s*\([^)]*\)\s*;/, ';')
 
     # scan for functions which return function pointers, because they are a pain
     source.gsub!(/([\w\s*]+)\(*\(\s*\*([\w\s*]+)\s*\(([\w\s*,]*)\)\)\s*\(([\w\s*,]*)\)\)*/) do |_m|
@@ -408,7 +472,25 @@ class CMockHeaderParser
     arg_info
   end
 
-  def parse_args(arg_list)
+  def extract_array_dims(arg_list)
+    dims = {}
+    arg_list.scan(/(\w+)\s*((?:\s*\[[^\[\]]*\])+)/) do |name, all_dims|
+      dim_list = all_dims.scan(/\[([^\[\]]*)\]/).map { |d| d[0].strip }
+      dims[name] = dim_list
+    end
+    dims
+  end
+
+  def extract_ptr_to_array_dims(arg_list)
+    dims = {}
+    arg_list.scan(/\(\s*\*\s*(\w+)\s*\)((?:\s*\[[^\[\]]*\])+)/) do |name, all_dims|
+      dim_list = all_dims.scan(/\[([^\[\]]*)\]/).map { |d| d[0].strip }
+      dims[name] = dim_list
+    end
+    dims
+  end
+
+  def parse_args(arg_list, array_dims_by_name = {}, ptr_to_array_dims_by_name = {})
     args = []
     arg_list.split(',').each do |arg|
       arg.strip!
@@ -417,6 +499,20 @@ class CMockHeaderParser
       arg_info = parse_type_and_name(arg)
       arg_info.delete(:modifier)             # don't care about this
       arg_info.delete(:c_calling_convention) # don't care about this
+
+      # Strip volatile from pointer-to-volatile arg types so internal storage and
+      # comparisons use the clean type; volatile? flag lets generators reconstruct
+      # it where needed (e.g. function signatures via arg_type_with_const).
+      arg_info[:type] = arg_info[:type].gsub(/\bvolatile\s*/, '').gsub(/\s+\*/, '*').strip if arg_info[:volatile?]
+
+      arg_info[:array_dims] = array_dims_by_name[arg_info[:name]] if array_dims_by_name.key?(arg_info[:name])
+
+      # Handle pointer-to-array args: (*name)[dims] was rewritten to * name before clean_args
+      if ptr_to_array_dims_by_name.key?(arg_info[:name])
+        arg_info[:array_dims] = ptr_to_array_dims_by_name[arg_info[:name]]
+        arg_info[:ptr_to_array?] = true
+        arg_info[:ptr?] = true # force true even for types like char* that divine_ptr would otherwise treat as strings
+      end
 
       # in C, array arguments implicitly degrade to pointers
       # make the translation explicit here to simplify later logic
@@ -429,18 +525,59 @@ class CMockHeaderParser
       args << arg_info
     end
 
-    # Try to find array pair in parameters following this pattern : <type> * <name>, <@array_size_type> <@array_size_name>
-    args.each_with_index do |val, index|
-      next_index = index + 1
-      next unless args.length > next_index
+    # Try to find array pairs using name-affinity scoring.
+    # Pairs each size-candidate arg with the best-matching pointer arg.
+    # Score: 10=exact root match, 7=prefix match, 5=substring match, +2 adjacency bonus (ptr immediately precedes size).
+    # Falls back to adjacency alone (score 2) when no name affinity found, preserving original behavior.
+    size_candidate_indices = args.each_index.select do |i|
+      args[i][:name].match(@array_size_name) && @array_size_type.include?(args[i][:type])
+    end
 
-      if (val[:ptr?] == true) && args[next_index][:name].match(@array_size_name) && @array_size_type.include?(args[next_index][:type])
-        val[:array_data?] = true
-        args[next_index][:array_size?] = true
+    size_candidate_indices.each do |size_idx|
+      best_score = 0
+      best_ptr_idx = nil
+
+      args.each_with_index do |ptr_arg, ptr_idx|
+        next unless (ptr_arg[:ptr?] || ptr_arg[:string?]) && !ptr_arg[:array_data?]
+
+        score = array_size_name_affinity(ptr_arg[:name], args[size_idx][:name])
+        score += 2 if ptr_idx + 1 == size_idx
+
+        if score > best_score
+          best_score = score
+          best_ptr_idx = ptr_idx
+        end
       end
+
+      next unless best_ptr_idx
+
+      args[best_ptr_idx][:array_size_name] = args[size_idx][:name]
+      args[best_ptr_idx][:array_size_order] = size_idx < best_ptr_idx ? :before : :after
+      args[size_idx][:array_size?] = true
     end
 
     args
+  end
+
+  def array_size_name_affinity(ptr_name, size_name)
+    size_words = @array_size_name.to_s.split('|').select { |w| w.match?(/^\w+$/) }
+    p_name = ptr_name.downcase
+    s_name = size_name.downcase
+
+    roots = size_words.flat_map do |word|
+      [
+        s_name.sub(/_#{Regexp.escape(word)}$/, ''),
+        s_name.sub(/^#{Regexp.escape(word)}_/, '')
+      ]
+    end.uniq.reject { |r| r.empty? || r == s_name }
+
+    roots.each do |root|
+      return 10 if root == p_name
+      return 7 if p_name.start_with?(root) || root.start_with?(p_name)
+      return 5 if p_name.include?(root) || root.include?(p_name)
+    end
+
+    0
   end
 
   def divine_ptr(arg)
@@ -461,11 +598,18 @@ class CMockHeaderParser
     end
   end
 
+  def divine_volatile(arg)
+    # only flag pointer types where volatile applies to the pointed-to type (before the last *)
+    arg.include?('*') && (/(^|\s|\*)volatile(\s(\w|\s)*)?\*(?!.*\*)/ =~ arg ? true : false)
+  end
+
   def divine_ptr_and_const(arg)
     divination = {}
 
     divination[:ptr?] = divine_ptr(arg)
+    divination[:string?] = !divination[:ptr?] && (/(^|\s)(const\s+)?char(\s+const)?\s*\*(?!.*\*)/ =~ arg ? true : false)
     divination[:const?] = divine_const(arg)
+    divination[:volatile?] = true if divine_volatile(arg)
 
     # an arg containing "const" after the last * is a constant pointer
     divination[:const_ptr?] = /\*(?!.*\*)\s*const(\s|$)/ =~ arg ? true : false
@@ -484,6 +628,10 @@ class CMockHeaderParser
       arg_list.gsub!(/\s+\*/, '*')
       # pull asterisks away from arg to place asterisks with type (where they belong)
       arg_list.gsub!(/\*(\w)/, '* \1')
+
+      # normalize parenthesized pointer arguments like int (* numb) -> int * numb
+      # negative lookahead prevents matching function pointers (*name)(args) and pointer-to-arrays (*name)[dims]
+      arg_list.gsub!(/\(\s*\*\s*((?:const\s+)?\w+)\s*\)(?!\s*[(\[])/, '* \1')
 
       # scan argument list for function pointers and replace them with custom types
       arg_list.gsub!(/([\w\s*]+)\(+([\w\s]*)\*[*\s]*([\w\s]*)\s*\)+\s*\(((?:[\w\s*]*,?)*)\s*\)*/) do |_m|
@@ -512,11 +660,24 @@ class CMockHeaderParser
         funcname = Regexp.last_match(2).strip
         funcargs = Regexp.last_match(3).strip
         funconst = ''
+        funcdecl = ''
         if funcname.include? 'const'
           funcname.gsub!('const', '').strip!
           funconst = 'const '
         end
-        parse_project[:typedefs] << "typedef #{funcret}(*#{functype})(#{funcargs});"
+        # Extract any calling convention from the return type (it belongs in the function pointer declaration)
+        @c_calling_conventions.each do |cc|
+          next unless funcret.include?(cc)
+
+          funcret = funcret.gsub(cc, '').strip
+          funcdecl = cc
+          break
+        end
+        parse_project[:typedefs] << if funcdecl.empty?
+                                      "typedef #{funcret}(*#{functype})(#{funcargs});"
+                                    else
+                                      "typedef #{funcret}(#{funcdecl} *#{functype})(#{funcargs});"
+                                    end
         funcname = "cmock_arg#{c += 1}" if funcname.empty?
         "#{functype} #{funconst}#{funcname}"
       end
@@ -567,9 +728,11 @@ class CMockHeaderParser
 
     rettype = parsed[:type]
     rettype = 'void' if @local_as_void.include?(rettype.strip)
+    rettype = 'void' if rettype.empty? && !(@standards + @local_as_void).include?(parsed[:name]) # all return-type tokens were stripped (e.g. bare decorator macros)
+    retstr = parsed[:const_ptr?] ? "#{rettype} const" : rettype
     decl[:return] = { :type       => rettype,
                       :name       => 'cmock_to_return',
-                      :str        => "#{rettype} cmock_to_return",
+                      :str        => "#{retstr} cmock_to_return",
                       :void?      => (rettype == 'void'),
                       :ptr?       => parsed[:ptr?]       || false,
                       :const?     => parsed[:const?]     || false,
@@ -590,12 +753,38 @@ class CMockHeaderParser
       decl[:var_arg] = nil
     end
 
+    # Extract pointer-to-array parameters (e.g., char (*buffer)[10]) and rewrite for normal processing
+    ptr_to_array_dims = extract_ptr_to_array_dims(args)
+    ptr_to_array_dims.each_key do |name|
+      args.gsub!(/\(\s*\*\s*#{Regexp.escape(name)}\s*\)((?:\s*\[[^\[\]]*\])+)/, "* #{name}")
+    end
+
+    # Extract array dimensions before cleaning converts them to pointer notation
+    array_dims_by_name = extract_array_dims(args)
+
     # parse out and clean up the remainder of the arguments
     args = clean_args(args, parse_project)
-    decl[:args_string] = args
-    decl[:args] = parse_args(args)
+    decl[:args] = parse_args(args, array_dims_by_name, ptr_to_array_dims)
+    # Rebuild args_string using original array notation where applicable
+    if args == 'void'
+      decl[:args_string] = args
+    else
+      arg_parts = args.split(/,\s*/)
+      decl[:args].each_with_index do |arg, i|
+        next unless arg[:array_dims]
+
+        base_type = arg[:type].sub(/\*$/, '').strip
+        dims_str = arg[:array_dims].map { |d| "[#{d}]" }.join
+        arg_parts[i] = if arg[:ptr_to_array?]
+                         "#{base_type} (*#{arg[:name]})#{dims_str}"
+                       else
+                         "#{base_type} #{arg[:name]}#{dims_str}"
+                       end
+      end
+      decl[:args_string] = arg_parts.join(', ')
+    end
     decl[:args_call] = decl[:args].map { |a| a[:name] }.join(', ')
-    decl[:contains_ptr?] = decl[:args].inject(false) { |ptr, arg| arg[:ptr?] ? true : ptr }
+    decl[:contains_ptr?] = decl[:args].inject(false) { |ptr, arg| arg[:ptr?] || arg[:string?] ? true : ptr }
 
     if decl[:return][:type].nil? || decl[:name].nil? || decl[:args].nil? ||
        decl[:return][:type].empty? || decl[:name].empty?
